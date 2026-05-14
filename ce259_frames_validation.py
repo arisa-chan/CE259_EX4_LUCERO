@@ -12,12 +12,185 @@
 #   4 = Diagonal    vecxz = (0,0,1)  →  local_z = global Z  (Wz = −w)
 # =====================================================================
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+_ADRS_WORKER_ENV = 'CE259_ADRS_WORKER'
+_ADRS_DIRECTION_ENV = 'CE259_ADRS_DIRECTION'
+_ADRS_OUTPUT_ENV = 'CE259_ADRS_OUTPUT'
+
+_DIRECTION_CONFIGS = {
+    'pos_x': {'label': '+X', 'axis': 'X', 'dof': 1, 'sign':  1.0, 'key': 'pos_x'},
+    'neg_x': {'label': '-X', 'axis': 'X', 'dof': 1, 'sign': -1.0, 'key': 'neg_x'},
+    'pos_y': {'label': '+Y', 'axis': 'Y', 'dof': 2, 'sign':  1.0, 'key': 'pos_y'},
+    'neg_y': {'label': '-Y', 'axis': 'Y', 'dof': 2, 'sign': -1.0, 'key': 'neg_y'},
+}
+_DIRECTION_ORDER = ['pos_x', 'neg_x', 'pos_y', 'neg_y']
+
+
+def _plot_direction_adrs(result):
+    import matplotlib.pyplot as plt
+
+    direction = result['direction']
+    sd_hist = result['sd_hist']
+    sa_hist = result['sa_hist']
+    capacity_sd = result['capacity_sd']
+    demand_sa = result['demand_sa']
+    performance = result['performance_point']
+    hazus = result['hazus']
+
+    fig, ax = plt.subplots(figsize=(7.4, 5.4))
+
+    thresholds = hazus['thresholds']
+    xmax_candidates = [max(sd_hist or [0.0])]
+    xmax_candidates.extend(thresholds.values())
+    if performance is not None:
+        xmax_candidates.append(performance['sd'])
+    xmax = max(xmax_candidates) * 1.08 if max(xmax_candidates) > 0.0 else 0.1
+
+    bands = [
+        ('None', 0.0, thresholds['Slight'], '#f2f2f2'),
+        ('Slight', thresholds['Slight'], thresholds['Moderate'], '#fff2b2'),
+        ('Moderate', thresholds['Moderate'], thresholds['Extensive'], '#ffd9a3'),
+        ('Extensive', thresholds['Extensive'], thresholds['Complete'], '#ffb3a6'),
+        ('Complete', thresholds['Complete'], xmax, '#d8c7ff'),
+    ]
+    for name, x0, x1, color in bands:
+        if x1 > x0:
+            ax.axvspan(x0, x1, color=color, alpha=0.22, linewidth=0,
+                       label=f'HAZUS {name}' if name != 'None' else None)
+
+    damage_lines = [
+        ('Slight', thresholds['Slight'], '#c7a100'),
+        ('Moderate', thresholds['Moderate'], '#d97900'),
+        ('Extensive', thresholds['Extensive'], '#c73b2f'),
+        ('Complete', thresholds['Complete'], '#6b3fb5'),
+    ]
+    for name, sd, color in damage_lines:
+        ax.axvline(sd, color=color, linestyle=':', linewidth=1.3,
+                   label=f'{name} threshold')
+
+    ax.plot(sd_hist, sa_hist, 'b-', linewidth=2.0, label='Capacity spectrum')
+    ax.plot(capacity_sd, demand_sa, 'm--', linewidth=2.0,
+            label='Demand spectrum (ASCE 41-23, secant $T_{eff}$)')
+
+    if performance is not None:
+        marker_label = ('Performance point' if performance['is_intersection']
+                        else 'Closest approach')
+        marker_color = 'darkgreen' if performance['is_intersection'] else 'dimgray'
+        ax.plot(performance['sd'], performance['sa'], 'o', color=marker_color,
+                markersize=7.5, label=marker_label)
+        ax.annotate(
+            f'{marker_label}\n'
+            f'$S_d$={performance["sd"]:.4f} m\n'
+            f'$S_a$={performance["sa"]:.3f} g',
+            xy=(performance['sd'], performance['sa']),
+            xytext=(10, 12),
+            textcoords='offset points',
+            fontsize=8,
+            bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='0.35', alpha=0.9),
+            arrowprops=dict(arrowstyle='->', lw=0.8, color='0.35'))
+
+    ax.set_xlim(left=0.0, right=xmax)
+    ax.set_xlabel('Spectral displacement  $S_d$  (m)', fontsize=11)
+    ax.set_ylabel('Spectral acceleration  $S_a$  (g)', fontsize=11)
+    ax.set_title(
+        f'{direction["label"]} Capacity-Demand Spectrum with HAZUS Damage States\n'
+        f'$T_1={result["modal"]["T1"]:.3f}$ s,  '
+        f'$\\alpha_1={result["modal"]["alpha1"]:.3f}$,  '
+        f'$PF_1 \\cdot \\phi_1(ctrl)={result["modal"]["PF1_phi"]:.3f}$',
+        fontsize=10)
+    ax.axhline(0, color='k', linewidth=0.5)
+    ax.axvline(0, color='k', linewidth=0.5)
+    ax.legend(fontsize=7.6, ncol=2)
+    ax.grid(alpha=0.35)
+    fig.tight_layout()
+
+
+def _print_four_direction_summary(results):
+    print('\n=== Four-direction ADRS summary ===')
+    header = ('Dir   Sd_pp(m)  Sa_pp(g)  T_eff(s)  Roof(mm)  Vbase(kN)  '
+              'Dy(m)    Du(m)    Status')
+    print(header)
+    print('-' * len(header))
+    for result in results:
+        pp = result['performance_point']
+        hz = result['hazus']
+        if pp is None:
+            print(f'{result["direction"]["label"]:>3}  no positive capacity-demand data')
+            continue
+        status = 'intersection' if pp['is_intersection'] else 'closest'
+        print(
+            f'{result["direction"]["label"]:>3}  '
+            f'{pp["sd"]:8.5f}  {pp["sa"]:8.5f}  {pp["teff"]:8.4f}  '
+            f'{pp["roof_disp_mm"]:8.2f}  {pp["base_shear_kN"]:9.2f}  '
+            f'{hz["Dy"]:7.5f}  {hz["Du"]:7.5f}  {status}'
+        )
+
+
+def _run_four_direction_adrs_parent():
+    import matplotlib.pyplot as plt
+
+    script_path = os.path.abspath(__file__)
+    results = []
+    with tempfile.TemporaryDirectory(prefix='ce259_adrs_') as tmpdir:
+        for direction_key in _DIRECTION_ORDER:
+            cfg = _DIRECTION_CONFIGS[direction_key]
+            out_path = os.path.join(tmpdir, f'{direction_key}.json')
+            env = os.environ.copy()
+            env[_ADRS_WORKER_ENV] = '1'
+            env[_ADRS_DIRECTION_ENV] = direction_key
+            env[_ADRS_OUTPUT_ENV] = out_path
+            env.setdefault('MPLBACKEND', 'Agg')
+            print(f'Running {cfg["label"]} pushover worker...')
+            proc = subprocess.run(
+                [sys.executable, script_path],
+                cwd=os.path.dirname(script_path),
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            if proc.stdout:
+                print(proc.stdout, end='' if proc.stdout.endswith('\n') else '\n')
+            if proc.returncode != 0:
+                if proc.stderr:
+                    print(proc.stderr, file=sys.stderr, end='' if proc.stderr.endswith('\n') else '\n')
+                return proc.returncode
+            if proc.stderr:
+                print(proc.stderr, file=sys.stderr, end='' if proc.stderr.endswith('\n') else '\n')
+            with open(out_path, 'r', encoding='utf-8') as f:
+                results.append(json.load(f))
+
+    _print_four_direction_summary(results)
+    for result in results:
+        _plot_direction_adrs(result)
+    plt.show()
+    return 0
+
+
+if os.environ.get(_ADRS_WORKER_ENV) != '1':
+    sys.exit(_run_four_direction_adrs_parent())
+
 import openseespy.opensees as ops
-import opsvis as opsv
+try:
+    import opsvis as opsv
+except ImportError:
+    opsv = None
 import math
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.animation as _animation
+
+_CURRENT_DIRECTION_KEY = os.environ.get(_ADRS_DIRECTION_ENV, 'pos_x')
+_CURRENT_DIRECTION = _DIRECTION_CONFIGS.get(_CURRENT_DIRECTION_KEY, _DIRECTION_CONFIGS['pos_x'])
+_CTRL_NODE = 76
+_CTRL_DOF = _CURRENT_DIRECTION['dof']
+_DIRECTION_SIGN = _CURRENT_DIRECTION['sign']
+_DIRECTION_LABEL = _CURRENT_DIRECTION['label']
+_SHOW_SINGLE_DIRECTION_DETAIL = False
 
 ops.wipe()
 ops.model('basic', '-ndm', 3, '-ndf', 6)
@@ -648,10 +821,10 @@ for _nd, _wt in _node_trib_W.items():
     _m = _wt / _g_accel
     ops.mass(_nd, _m, _m, _m, 0.0, 0.0, 0.0)
 
-# Eigenanalysis — compute 3 modes to identify the X-direction dominant mode.
+# Eigenanalysis — compute 3 modes to identify the current-direction dominant mode.
 # In a 3D model with plan asymmetry (roof-stair block), mode 1 (lowest freq)
-# may be a Y-sway or torsional mode rather than X-sway.  We scan all three
-# modes and pick the one with the largest X-direction effective mass.
+# may be orthogonal sway or torsion.  We scan all three modes and pick the
+# one with the largest effective mass in the requested direction.
 ops.wipeAnalysis()
 _n_modes = 3
 _lambdas  = ops.eigen(_n_modes)
@@ -659,48 +832,49 @@ _lambdas  = ops.eigen(_n_modes)
 _mi_modal = {nd: _node_trib_W[nd] / _g_accel for nd in _node_trib_W}
 _Mt_modal = sum(_mi_modal.values())
 
-print('--- Modal scan (X-direction) ---')
+print(f'--- Modal scan ({_DIRECTION_LABEL} direction) ---')
 _mode_candidates = []
 for _m in range(1, _n_modes + 1):
     _om_m = math.sqrt(_lambdas[_m - 1])
     _T_m  = 2.0 * math.pi / _om_m
-    # Raw X-DOF components of mode m at every mass-carrying node
-    _phi_raw = {nd: ops.nodeEigenvector(nd, _m, 1) for nd in _mi_modal}
+    # Raw directional DOF components of mode m at every mass-carrying node
+    _phi_raw = {nd: ops.nodeEigenvector(nd, _m, _CTRL_DOF) for nd in _mi_modal}
     _phi_max = max(abs(v) for v in _phi_raw.values()) or 1.0
     _phi_n   = {nd: v / _phi_max for nd, v in _phi_raw.items()}
     _Lm = sum(_mi_modal[nd] * _phi_n[nd]    for nd in _mi_modal)
     _Mm = sum(_mi_modal[nd] * _phi_n[nd]**2 for nd in _mi_modal)
-    _Meff_X = (_Lm**2 / _Mm) if _Mm > 1e-12 else 0.0
-    print(f'  Mode {_m}: T={_T_m:.3f} s, M_eff_X={_Meff_X:.2f} Mg '
-          f'({100.0 * _Meff_X / _Mt_modal:.1f}% of total mass)')
-    _mode_candidates.append((_Meff_X, _m, _om_m, _phi_raw, _phi_max))
+    _Meff_dir = (_Lm**2 / _Mm) if _Mm > 1e-12 else 0.0
+    print(f'  Mode {_m}: T={_T_m:.3f} s, '
+          f'M_eff_{_CURRENT_DIRECTION["axis"]}={_Meff_dir:.2f} Mg '
+          f'({100.0 * _Meff_dir / _Mt_modal:.1f}% of total mass)')
+    _mode_candidates.append((_Meff_dir, _m, _om_m, _phi_raw, _phi_max))
 
-# Select the mode with the highest X-direction effective mass
+# Select the mode with the highest directional effective mass
 _mode_candidates.sort(key=lambda x: -x[0])
-_Meff_X_best, _mode_X, _omega1, _phi_raw_best, _phi_max_best = _mode_candidates[0]
+_Meff_dir_best, _mode_dir, _omega1, _phi_raw_best, _phi_max_best = _mode_candidates[0]
 _T1 = 2.0 * math.pi / _omega1
-print(f'X-direction dominant mode: Mode {_mode_X}  (T\u2081 = {_T1:.3f} s)')
+print(f'{_DIRECTION_LABEL} dominant mode: Mode {_mode_dir}  (T\u2081 = {_T1:.3f} s)')
 
 # Normalise to max|φ|=1 AND enforce POSITIVE sign at the control node.
 # OpenSeesPy eigenvector sign is arbitrary; without this fix PF₁ is negative
-# whenever the solver returns the mode with all-negative X-components.
-_sign_fix = math.copysign(1.0, _phi_raw_best.get(76, _phi_max_best))
-_phi1_x   = {nd: _sign_fix * v / _phi_max_best for nd, v in _phi_raw_best.items()}
+# whenever the solver returns the mode with all-negative directional components.
+_sign_fix = math.copysign(1.0, _phi_raw_best.get(_CTRL_NODE, _phi_max_best))
+_phi1_dir = {nd: _sign_fix * v / _phi_max_best for nd, v in _phi_raw_best.items()}
 
-# Modal quantities — X-direction participation (Chopra §13.1)
+# Modal quantities — directional participation (Chopra §13.1)
 #   L₁ = Σ mᵢ φᵢ   (numerator of PF)
-#   M₁ = Σ mᵢ φᵢ²  (generalised mass from X-DOF)
+#   M₁ = Σ mᵢ φᵢ²  (generalised mass from directional DOF)
 #   PF₁ = L₁/M₁,   M*₁ = L₁²/M₁,   α₁ = M*₁/M_total
-_Lm_modal = sum(_mi_modal[nd] * _phi1_x[nd]    for nd in _mi_modal)
-_Mm_modal = sum(_mi_modal[nd] * _phi1_x[nd]**2 for nd in _mi_modal)
+_Lm_modal = sum(_mi_modal[nd] * _phi1_dir[nd]    for nd in _mi_modal)
+_Mm_modal = sum(_mi_modal[nd] * _phi1_dir[nd]**2 for nd in _mi_modal)
 
 _PF1        = _Lm_modal / _Mm_modal
 _M_eff1     = _Lm_modal**2 / _Mm_modal
 _alpha1     = _M_eff1 / _Mt_modal
-_phi_ctrl_1 = _phi1_x.get(76, 1.0)   # ctrl_node = 76 (z = 10.8 m)
+_phi_ctrl_1 = _phi1_dir.get(_CTRL_NODE, 1.0)   # ctrl_node = 76 (z = 10.8 m)
 _PF1_phi    = _PF1 * _phi_ctrl_1      # always > 0 after sign fix
 
-print(f'PF\u2081 = {_PF1:.4f}  |  \u03c6\u2081(ctrl=76) = {_phi_ctrl_1:.4f}  |  '
+print(f'PF\u2081 = {_PF1:.4f}  |  \u03c6\u2081(ctrl={_CTRL_NODE}) = {_phi_ctrl_1:.4f}  |  '
       f'PF\u2081\u00b7\u03c6\u2081(ctrl) = {_PF1_phi:.4f}  |  \u03b1\u2081 = {_alpha1:.4f}')
 
 # =====================================================================
@@ -712,29 +886,13 @@ ops.loadConst('-time', 0.0)
 ops.timeSeries('Linear', 2)
 ops.pattern('Plain', 2, 2)
 # All nodes at Z = 10.800 m: [50,52,54,56,58,60,62,64,66,68,70,72,74,76,78,80,93,94,95,96,107,108]
-# Distribute reference lateral loads at z=10.8 nodes (X-direction):
-ops.load(50,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(52,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(54,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(56,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(58,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(60,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(62,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(64,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(66,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(68,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(70,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(72,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(74,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(76,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(78,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(80,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(93,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(94,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(95,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(96,  1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(107, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
-ops.load(108, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # lateral X
+# Distribute reference lateral loads at z=10.8 nodes in the requested direction.
+_lateral_load_nodes = [50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70,
+                       72, 74, 76, 78, 80, 93, 94, 95, 96, 107, 108]
+for _nd in _lateral_load_nodes:
+    _load = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    _load[_CTRL_DOF - 1] = _DIRECTION_SIGN
+    ops.load(_nd, *_load)
 
 ops.system('UmfPack')
 ops.constraints('Transformation')
@@ -743,13 +901,13 @@ ops.test('NormDispIncr', 1.0e-8, 100, 0)
 ops.algorithm('Newton')
 ops.analysis('Static')
 
-ctrl_node = 76   # control node at z = 10.800 m
-ctrl_dof  = 1             # 1 = X,  2 = Y,  3 = Z
+ctrl_node = _CTRL_NODE   # control node at z = 10.800 m
+ctrl_dof  = _CTRL_DOF    # 1 = X,  2 = Y,  3 = Z
 H_total   = 10.800        # height to control node (m)
 target_drift = 0.02       # target drift ratio  (adjust as needed)
 target_disp  = target_drift * H_total   # m
 n_steps = 200
-dU      = target_disp / n_steps
+dU      = _DIRECTION_SIGN * target_disp / n_steps
 
 disp_hist  = [0.0]
 shear_hist = [0.0]
@@ -803,10 +961,11 @@ for step in range(n_steps):
         break
     ops.reactions()
     d = ops.nodeDisp(ctrl_node, ctrl_dof)
-    # Sum X-reactions at base nodes: [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31]
-    V = sum(ops.nodeReaction(t, 1) for t in [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31])
-    disp_hist.append(d * 1000)   # convert to mm
-    shear_hist.append(-V)        # sign: positive = resistive force
+    # Sum base reactions in the current pushover direction.
+    V = sum(ops.nodeReaction(t, ctrl_dof)
+            for t in [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31])
+    disp_hist.append(_DIRECTION_SIGN * d * 1000.0)   # positive magnitude [mm]
+    shear_hist.append(-_DIRECTION_SIGN * V)          # positive resistive force [kN]
 
     # --- snapshot every step for animation ---
     _step_counter_v += 1
@@ -822,28 +981,30 @@ for step in range(n_steps):
         _snap_curvs[_et] = _sec_curvs
     _hinge_snapshots_v.append({
         'step': _step_counter_v,
-        'disp': d * 1000,
-        'shear': -V,
+        'disp': _DIRECTION_SIGN * d * 1000.0,
+        'shear': -_DIRECTION_SIGN * V,
         'curvatures': _snap_curvs,
     })
 
-print('Pushover complete.')
+print(f'{_DIRECTION_LABEL} pushover complete.')
 
 # =====================================================================
 # VISUALISATION
 # =====================================================================
-opsv.plot_model()
+if _SHOW_SINGLE_DIRECTION_DETAIL:
+    if opsv is not None:
+        opsv.plot_model()
 
-fig, ax = plt.subplots(figsize=(8, 5))
-ax.plot(disp_hist, shear_hist, 'r-', linewidth=2, label='OpenSeesPy')
-ax.set_xlabel('Roof displacement  (mm)')
-ax.set_ylabel('Base shear  (kN)')
-ax.set_title(f'Pushover Curve')
-ax.axhline(0, color="k", linewidth=0.5)
-ax.axvline(0, color="k", linewidth=0.5)
-ax.legend(); ax.grid(alpha=0.4)
-fig.tight_layout()
-plt.show()
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(disp_hist, shear_hist, 'r-', linewidth=2, label='OpenSeesPy')
+    ax.set_xlabel('Roof displacement  (mm)')
+    ax.set_ylabel('Base shear  (kN)')
+    ax.set_title(f'{_DIRECTION_LABEL} Pushover Curve')
+    ax.axhline(0, color="k", linewidth=0.5)
+    ax.axvline(0, color="k", linewidth=0.5)
+    ax.legend(); ax.grid(alpha=0.4)
+    fig.tight_layout()
+    plt.show()
 
 # =====================================================================
 # CAPACITY SPECTRUM  (Sa – Sd,  ADRS format)
@@ -856,15 +1017,314 @@ plt.show()
 _Sa_hist = [(v / _W_seismic) / _alpha1  for v in shear_hist]   # [g]
 _Sd_hist = [(d / 1000.0)     / _PF1_phi for d in disp_hist ]   # [m]
 
+_SXS = 1.21   # ASCE 41-23 short-period spectral response acceleration [g]
+_SX1 = 0.44   # ASCE 41-23 1-second spectral response acceleration [g]
+_G   = 9.81   # gravitational acceleration [m/s²]
+_TS  = _SX1 / _SXS
+_T0  = 0.2 * _TS
+
+
+def _asce41_23_sa(T):
+    """Two-period ASCE 41-23 horizontal spectrum, 5% damping."""
+    if T <= 0.0:
+        return 0.4 * _SXS
+    if T < _T0:
+        return _SXS * (0.4 + 0.6 * T / _T0)
+    if T <= _TS:
+        return _SXS
+    return _SX1 / T
+
+
+def _effective_secant_period(sd, sa):
+    """Return T_eff from secant stiffness of the capacity spectrum point."""
+    if sd <= 0.0 or sa <= 0.0:
+        return None
+    omega_sq = (sa * _G) / sd
+    if omega_sq <= 0.0:
+        return None
+    return 2.0 * math.pi / math.sqrt(omega_sq)
+
+
+def _find_first_intersection(sd_vals, cap_sa_vals, demand_sa_vals, teff_vals):
+    """Find the first linearly interpolated cap-demand crossing."""
+    if not sd_vals:
+        return None
+
+    prev = None
+    for sd, cap_sa, demand_sa, teff in zip(sd_vals, cap_sa_vals, demand_sa_vals, teff_vals):
+        diff = cap_sa - demand_sa
+        point = (sd, cap_sa, demand_sa, teff, diff)
+        if abs(diff) <= 1.0e-10:
+            return {
+                'sd': sd,
+                'sa_capacity': cap_sa,
+                'sa_demand': demand_sa,
+                'sa': cap_sa,
+                'teff': teff,
+                'is_intersection': True,
+            }
+        if prev is not None:
+            psd, pcap_sa, pdemand_sa, pteff, pdiff = prev
+            if pdiff * diff < 0.0:
+                ratio = -pdiff / (diff - pdiff)
+                sd_pp = psd + ratio * (sd - psd)
+                cap_pp = pcap_sa + ratio * (cap_sa - pcap_sa)
+                demand_pp = pdemand_sa + ratio * (demand_sa - pdemand_sa)
+                teff_pp = pteff + ratio * (teff - pteff)
+                return {
+                    'sd': sd_pp,
+                    'sa_capacity': cap_pp,
+                    'sa_demand': demand_pp,
+                    'sa': 0.5 * (cap_pp + demand_pp),
+                    'teff': teff_pp,
+                    'is_intersection': True,
+                }
+        prev = point
+
+    closest_idx = min(range(len(sd_vals)),
+                      key=lambda i: abs(cap_sa_vals[i] - demand_sa_vals[i]))
+    return {
+        'sd': sd_vals[closest_idx],
+        'sa_capacity': cap_sa_vals[closest_idx],
+        'sa_demand': demand_sa_vals[closest_idx],
+        'sa': cap_sa_vals[closest_idx],
+        'teff': teff_vals[closest_idx],
+        'is_intersection': False,
+    }
+
+
+def _trapz_area(x_vals, y_vals):
+    area = 0.0
+    for i in range(1, len(x_vals)):
+        dx = x_vals[i] - x_vals[i - 1]
+        area += 0.5 * dx * (y_vals[i] + y_vals[i - 1])
+    return area
+
+
+def _fit_initial_stiffness(sd_vals, sa_vals, peak_sa):
+    elastic_points = [(sd, sa) for sd, sa in zip(sd_vals, sa_vals)
+                      if sd > 0.0 and sa > 0.0 and sa <= 0.60 * peak_sa]
+    if len(elastic_points) < 2:
+        elastic_points = [(sd, sa) for sd, sa in zip(sd_vals[:5], sa_vals[:5])
+                          if sd > 0.0 and sa > 0.0]
+    denom = sum(sd * sd for sd, _sa in elastic_points)
+    if denom <= 0.0:
+        return None
+    return sum(sd * sa for sd, sa in elastic_points) / denom
+
+
+def _idealize_capacity_equal_area(sd_vals, sa_vals):
+    """Equal-area bilinear idealization used for HAZUS displacement thresholds."""
+    if len(sd_vals) < 2:
+        return None
+
+    peak_idx = max(range(len(sa_vals)), key=lambda i: sa_vals[i])
+    peak_sa = sa_vals[peak_idx]
+    if peak_sa <= 0.0:
+        return None
+
+    du_idx = len(sd_vals) - 1
+    for i in range(peak_idx + 1, len(sa_vals)):
+        if sa_vals[i] <= 0.80 * peak_sa:
+            du_idx = i
+            break
+
+    du = sd_vals[du_idx]
+    au = sa_vals[du_idx]
+    if du <= 0.0 or au <= 0.0:
+        return None
+
+    k0 = _fit_initial_stiffness(sd_vals[:du_idx + 1], sa_vals[:du_idx + 1], peak_sa)
+    if k0 is None or k0 <= 0.0:
+        return None
+
+    x_area = [0.0] + sd_vals[:du_idx + 1]
+    y_area = [0.0] + sa_vals[:du_idx + 1]
+    target_area = _trapz_area(x_area, y_area)
+
+    denom = k0 * du - au
+    dy = None
+    if abs(denom) > 1.0e-12:
+        dy = (2.0 * target_area - du * au) / denom
+
+    dy_upper = min(0.95 * du, sd_vals[peak_idx] if peak_idx <= du_idx else 0.95 * du)
+    if dy_upper <= 0.0:
+        dy_upper = 0.95 * du
+    if dy is None or dy <= 0.0 or dy >= du:
+        dy = au / k0
+    dy = max(min(dy, dy_upper), 1.0e-9)
+    ay = k0 * dy
+
+    thresholds = {
+        'Slight': 0.70 * dy,
+        'Moderate': dy,
+        'Extensive': dy + 0.25 * (du - dy),
+        'Complete': du,
+    }
+    return {
+        'Dy': dy,
+        'Ay': ay,
+        'Du': du,
+        'Au': au,
+        'initial_stiffness': k0,
+        'peak_Sd': sd_vals[peak_idx],
+        'peak_Sa': peak_sa,
+        'thresholds': thresholds,
+    }
+
+
+_capacity_sd = []
+_capacity_sa = []
+_demand_sa = []
+_teff_hist = []
+
+for _sd, _sa in zip(_Sd_hist, _Sa_hist):
+    if _sd <= 0.0 or _sa <= 0.0:
+        continue
+    if _capacity_sd and _sd <= _capacity_sd[-1] + 1.0e-12:
+        continue
+    _teff = _effective_secant_period(_sd, _sa)
+    if _teff is None:
+        continue
+    _capacity_sd.append(_sd)
+    _capacity_sa.append(_sa)
+    _teff_hist.append(_teff)
+    _demand_sa.append(_asce41_23_sa(_teff))
+
+_performance_point = _find_first_intersection(
+    _capacity_sd, _capacity_sa, _demand_sa, _teff_hist)
+
+if _performance_point is None:
+    print('WARNING: No positive capacity-demand points were available.')
+else:
+    _pp_sd = _performance_point['sd']
+    _pp_sa = _performance_point['sa']
+    _pp_teff = _performance_point['teff']
+    _pp_roof_disp_mm = _pp_sd * _PF1_phi * 1000.0
+    _pp_base_shear = _pp_sa * _alpha1 * _W_seismic
+    _performance_point['roof_disp_mm'] = _pp_roof_disp_mm
+    _performance_point['base_shear_kN'] = _pp_base_shear
+    if _performance_point['is_intersection']:
+        print(f'{_DIRECTION_LABEL} performance point from ASCE 41-23 secant-stiffness demand:')
+    else:
+        print(f'WARNING: No {_DIRECTION_LABEL} capacity-demand intersection within pushover range; '
+              'reporting closest approach:')
+    print(f'  Sd = {_pp_sd:.5f} m')
+    print(f'  Sa = {_pp_sa:.5f} g')
+    print(f'  T_eff = {_pp_teff:.4f} s')
+    print(f'  Roof displacement = {_pp_roof_disp_mm:.2f} mm')
+    print(f'  Base shear = {_pp_base_shear:.2f} kN')
+    if not _performance_point['is_intersection']:
+        print(f'  Capacity Sa = {_performance_point["sa_capacity"]:.5f} g | '
+              f'Demand Sa = {_performance_point["sa_demand"]:.5f} g')
+
+_hazus = _idealize_capacity_equal_area(_capacity_sd, _capacity_sa)
+if _hazus is None:
+    print(f'WARNING: HAZUS damage thresholds could not be computed for {_DIRECTION_LABEL}.')
+    _hazus = {
+        'Dy': 0.0,
+        'Ay': 0.0,
+        'Du': max(_capacity_sd or [0.0]),
+        'Au': 0.0,
+        'initial_stiffness': 0.0,
+        'peak_Sd': 0.0,
+        'peak_Sa': 0.0,
+        'thresholds': {'Slight': 0.0, 'Moderate': 0.0, 'Extensive': 0.0, 'Complete': 0.0},
+    }
+else:
+    print(f'{_DIRECTION_LABEL} HAZUS-MH 2.1 damage thresholds from equal-area bilinear capacity:')
+    print(f'  Dy = {_hazus["Dy"]:.5f} m | Ay = {_hazus["Ay"]:.5f} g')
+    print(f'  Du = {_hazus["Du"]:.5f} m | Au = {_hazus["Au"]:.5f} g')
+    print('  Thresholds: '
+          f'Slight={_hazus["thresholds"]["Slight"]:.5f} m, '
+          f'Moderate={_hazus["thresholds"]["Moderate"]:.5f} m, '
+          f'Extensive={_hazus["thresholds"]["Extensive"]:.5f} m, '
+          f'Complete={_hazus["thresholds"]["Complete"]:.5f} m')
+
+if _performance_point is None and _capacity_sd:
+    _idx = min(range(len(_capacity_sd)), key=lambda i: abs(_capacity_sa[i] - _demand_sa[i]))
+    _performance_point = {
+        'sd': _capacity_sd[_idx],
+        'sa_capacity': _capacity_sa[_idx],
+        'sa_demand': _demand_sa[_idx],
+        'sa': _capacity_sa[_idx],
+        'teff': _teff_hist[_idx],
+        'is_intersection': False,
+    }
+    _performance_point['roof_disp_mm'] = _performance_point['sd'] * _PF1_phi * 1000.0
+    _performance_point['base_shear_kN'] = _performance_point['sa'] * _alpha1 * _W_seismic
+elif _performance_point is None:
+    _performance_point = {
+        'sd': 0.0,
+        'sa_capacity': 0.0,
+        'sa_demand': 0.0,
+        'sa': 0.0,
+        'teff': 0.0,
+        'is_intersection': False,
+        'roof_disp_mm': 0.0,
+        'base_shear_kN': 0.0,
+    }
+
+if os.environ.get(_ADRS_OUTPUT_ENV):
+    _worker_payload = {
+        'direction': _CURRENT_DIRECTION,
+        'modal': {
+            'mode': _mode_dir,
+            'T1': _T1,
+            'alpha1': _alpha1,
+            'PF1': _PF1,
+            'phi_ctrl': _phi_ctrl_1,
+            'PF1_phi': _PF1_phi,
+            'effective_mass': _Meff_dir_best,
+        },
+        'hazard': {
+            'SXS': _SXS,
+            'SX1': _SX1,
+            'TS': _TS,
+            'T0': _T0,
+        },
+        'sd_hist': _Sd_hist,
+        'sa_hist': _Sa_hist,
+        'capacity_sd': _capacity_sd,
+        'capacity_sa': _capacity_sa,
+        'demand_sa': _demand_sa,
+        'teff': _teff_hist,
+        'performance_point': _performance_point,
+        'hazus': _hazus,
+    }
+    with open(os.environ[_ADRS_OUTPUT_ENV], 'w', encoding='utf-8') as _f:
+        json.dump(_worker_payload, _f, indent=2)
+    sys.exit(0)
+
 fig_cs, ax_cs = plt.subplots(figsize=(7, 5))
 ax_cs.plot(_Sd_hist, _Sa_hist, 'b-', linewidth=2, label='Capacity spectrum')
+if _capacity_sd:
+    ax_cs.plot(_capacity_sd, _demand_sa, 'm--', linewidth=2,
+               label='Demand spectrum (ASCE 41-23, secant $T_{eff}$)')
+if _performance_point is not None:
+    _marker_label = ('Performance point' if _performance_point['is_intersection']
+                     else 'Closest approach')
+    _marker_color = 'darkgreen' if _performance_point['is_intersection'] else 'dimgray'
+    ax_cs.plot(_performance_point['sd'], _performance_point['sa'], 'o',
+               color=_marker_color, markersize=7, label=_marker_label)
+    ax_cs.annotate(
+        f'{_marker_label}\n'
+        f'$S_d$={_performance_point["sd"]:.4f} m\n'
+        f'$S_a$={_performance_point["sa"]:.3f} g',
+        xy=(_performance_point['sd'], _performance_point['sa']),
+        xytext=(10, 12),
+        textcoords='offset points',
+        fontsize=8,
+        bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='0.35', alpha=0.9),
+        arrowprops=dict(arrowstyle='->', lw=0.8, color='0.35'))
 ax_cs.set_xlabel('Spectral displacement  $S_d$  (m)', fontsize=11)
 ax_cs.set_ylabel('Spectral acceleration  $S_a$  (g)', fontsize=11)
 ax_cs.set_title(
-    f'Capacity Spectrum — E2K Validation Model\n'
+    f'Capacity-Demand Spectrum — E2K Validation Model\n'
     f'$T_1={_T1:.3f}$ s,  '
     f'$\\alpha_1={_alpha1:.3f}$,  '
-    f'$PF_1 \\cdot \\phi_1(ctrl)={_PF1_phi:.3f}$',
+    f'$PF_1 \\cdot \\phi_1(ctrl)={_PF1_phi:.3f}$,  '
+    f'$S_{{XS}}={_SXS:.2f}g$,  $S_{{X1}}={_SX1:.2f}g$',
     fontsize=10)
 ax_cs.axhline(0, color='k', linewidth=0.5)
 ax_cs.axvline(0, color='k', linewidth=0.5)
