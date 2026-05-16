@@ -21,7 +21,6 @@ import tempfile
 _ADRS_WORKER_ENV = 'CE259_ADRS_WORKER'
 _ADRS_DIRECTION_ENV = 'CE259_ADRS_DIRECTION'
 _ADRS_OUTPUT_ENV = 'CE259_ADRS_OUTPUT'
-_ADRS_VARIANT_ENV = 'CE259_ADRS_VARIANT'
 
 _DIRECTION_CONFIGS = {
     'pos_x': {'label': '+X', 'axis': 'X', 'dof': 1, 'sign':  1.0, 'key': 'pos_x'},
@@ -30,18 +29,6 @@ _DIRECTION_CONFIGS = {
     'neg_y': {'label': '-Y', 'axis': 'Y', 'dof': 2, 'sign': -1.0, 'key': 'neg_y'},
 }
 _DIRECTION_ORDER = ['pos_x', 'neg_x', 'pos_y', 'neg_y']
-
-_VARIANT_CONFIGS = {
-    'original': {'key': 'original', 'label': 'Original', 'is_retrofit': False},
-    'retrofit': {'key': 'retrofit', 'label': 'Retrofitted', 'is_retrofit': True},
-}
-_VARIANT_ORDER = ['original', 'retrofit']
-
-# Ground-floor B300x500 beam elements, all at z=0.
-_RETROFIT_BEAM_ELEMS = {72, 73, 74, 84, 85, 86, 87, 88, 89, 90, 91, 92}
-_RETROFIT_BEAM_SECTION_ID = 7
-_RETROFIT_BEAM_INTEGRATION_ID = 7
-_RETROFIT_BEAM_GRAV_W = 6.0
 
 
 def _plot_direction_adrs(result):
@@ -123,118 +110,6 @@ def _plot_direction_adrs(result):
     fig.tight_layout()
 
 
-def _plot_direction_adrs_comparison(original, retrofit):
-    import matplotlib.pyplot as plt
-
-    direction = original['direction']
-    fig, ax = plt.subplots(figsize=(8.2, 5.8))
-
-    series = [
-        ('Original', original, '#1f77b4', '-', 'o'),
-        ('Retrofitted', retrofit, '#2ca02c', '-', 's'),
-    ]
-    demand_styles = {
-        'Original': ('#c2185b', '--'),
-        'Retrofitted': ('#7b1fa2', '-.'),
-    }
-
-    xmax_candidates = []
-    ymax_candidates = []
-    for _, result, _, _, _ in series:
-        xmax_candidates.extend(result.get('sd_hist', []) or [])
-        xmax_candidates.extend(result.get('capacity_sd', []) or [])
-        ymax_candidates.extend(result.get('sa_hist', []) or [])
-        ymax_candidates.extend(result.get('demand_sa', []) or [])
-        pp = result.get('performance_point')
-        if pp is not None:
-            xmax_candidates.append(pp.get('sd', 0.0))
-            ymax_candidates.append(pp.get('sa', 0.0))
-        thresholds = result.get('hazus', {}).get('thresholds', {})
-        xmax_candidates.extend(thresholds.values())
-
-    xmax_base = max(xmax_candidates or [0.0])
-    ymax_base = max(ymax_candidates or [0.0])
-    xmax = xmax_base * 1.08 if xmax_base > 0.0 else 0.1
-    ymax = ymax_base * 1.12 if ymax_base > 0.0 else 1.0
-
-    # Light background bands from the original capacity idealization keep the
-    # damage-state regions readable while both variants get their own lines.
-    thresholds = original.get('hazus', {}).get('thresholds', {})
-    if thresholds:
-        bands = [
-            ('None', 0.0, thresholds['Slight'], '#f2f2f2'),
-            ('Slight', thresholds['Slight'], thresholds['Moderate'], '#fff2b2'),
-            ('Moderate', thresholds['Moderate'], thresholds['Extensive'], '#ffd9a3'),
-            ('Extensive', thresholds['Extensive'], thresholds['Complete'], '#ffb3a6'),
-            ('Complete', thresholds['Complete'], xmax, '#d8c7ff'),
-        ]
-        for name, x0, x1, color in bands:
-            if x1 > x0:
-                ax.axvspan(x0, x1, color=color, alpha=0.14, linewidth=0,
-                           label=f'HAZUS {name}' if name != 'None' else None)
-
-    damage_names = [('Slight', 'SL'), ('Moderate', 'MO'),
-                    ('Extensive', 'EX'), ('Complete', 'CO')]
-    for idx, (label, result, color, _, _) in enumerate(series):
-        thresholds = result.get('hazus', {}).get('thresholds', {})
-        line_style = ':' if label == 'Original' else (0, (5, 2, 1, 2))
-        for j, (name, short) in enumerate(damage_names):
-            sd = thresholds.get(name)
-            if sd is None:
-                continue
-            ax.axvline(sd, color=color, linestyle=line_style, linewidth=1.15,
-                       alpha=0.9,
-                       label=f'{label} HAZUS thresholds' if j == 0 else None)
-            if 0.0 < sd < xmax:
-                ax.text(sd, ymax * (0.97 - 0.055 * idx), f'{label[0]}-{short}',
-                        rotation=90, color=color, fontsize=6.8,
-                        ha='right', va='top')
-
-    for label, result, color, line_style, marker in series:
-        ax.plot(result.get('sd_hist', []), result.get('sa_hist', []),
-                color=color, linestyle=line_style, linewidth=2.0,
-                label=f'{label} capacity')
-        demand_color, demand_style = demand_styles[label]
-        ax.plot(result.get('capacity_sd', []), result.get('demand_sa', []),
-                color=demand_color, linestyle=demand_style, linewidth=1.8,
-                label=f'{label} demand, secant $T_{{eff}}$')
-
-        pp = result.get('performance_point')
-        if pp is None:
-            continue
-        marker_label = (f'{label} performance point' if pp['is_intersection']
-                        else f'{label} closest approach')
-        ax.plot(pp['sd'], pp['sa'], marker=marker, color=color,
-                markeredgecolor='black', markersize=7.5, linestyle='None',
-                label=marker_label)
-        offset = (10, 12) if label == 'Original' else (10, -38)
-        ax.annotate(
-            f'{label}\n$S_d$={pp["sd"]:.4f} m\n$S_a$={pp["sa"]:.3f} g',
-            xy=(pp['sd'], pp['sa']),
-            xytext=offset,
-            textcoords='offset points',
-            fontsize=7.5,
-            bbox=dict(boxstyle='round,pad=0.22', fc='white', ec=color, alpha=0.9),
-            arrowprops=dict(arrowstyle='->', lw=0.75, color=color))
-
-    ax.set_xlim(left=0.0, right=xmax)
-    ax.set_ylim(bottom=0.0, top=ymax)
-    ax.set_xlabel('Spectral displacement  $S_d$  (m)', fontsize=11)
-    ax.set_ylabel('Spectral acceleration  $S_a$  (g)', fontsize=11)
-    ax.set_title(
-        f'{direction["label"]} ADRS Comparison: Original vs Retrofitted\n'
-        f'Original $T_1={original["modal"]["T1"]:.3f}$ s, '
-        f'Retrofit $T_1={retrofit["modal"]["T1"]:.3f}$ s, '
-        f'$S_{{XS}}={original["hazard"]["SXS"]:.2f}g$, '
-        f'$S_{{X1}}={original["hazard"]["SX1"]:.2f}g$',
-        fontsize=10)
-    ax.axhline(0, color='k', linewidth=0.5)
-    ax.axvline(0, color='k', linewidth=0.5)
-    ax.legend(fontsize=7.2, ncol=2)
-    ax.grid(alpha=0.35)
-    fig.tight_layout()
-
-
 def _plot_direction_hinges_3d(result):
     import matplotlib.pyplot as plt
     import matplotlib.lines as mlines
@@ -305,9 +180,8 @@ def _plot_direction_hinges_3d(result):
                       label=f'>= CP ({counts.get(">= CP", 0)})'),
     ]
     ax.legend(handles=legend_items, loc='upper left', fontsize=8)
-    variant = result.get('variant', {'label': 'Original'})
     ax.set_title(
-        f'{result["direction"]["label"]} {variant["label"]} '
+        f'{result["direction"]["label"]} Original '
         'ACI 369.1M-17 Hinging Members at Performance Point',
         fontsize=10,
     )
@@ -320,107 +194,93 @@ def _plot_direction_hinges_3d(result):
 
 
 def _print_four_direction_summary(results_by_direction):
-    print('\n=== Four-direction ADRS comparison summary ===')
-    header = ('Dir  Variant       Sd_pp(m)  Sa_pp(g)  T_eff(s)  Roof(mm)  '
+    print('\n=== Four-direction original ADRS summary ===')
+    header = ('Dir  Sd_pp(m)  Sa_pp(g)  T_eff(s)  Roof(mm)  '
               'Vbase(kN)  Dy(m)    Du(m)    IO-LS  LS-CP  >=CP  Status')
     print(header)
     print('-' * len(header))
     for direction_key in _DIRECTION_ORDER:
-        variants = results_by_direction.get(direction_key, {})
-        for variant_key in _VARIANT_ORDER:
-            result = variants.get(variant_key)
-            if result is None:
-                continue
-            pp = result['performance_point']
-            hz = result['hazus']
-            hc = result.get('hinge_damage_counts', {})
-            variant = result.get('variant', _VARIANT_CONFIGS[variant_key])
-            if pp is None:
-                print(f'{result["direction"]["label"]:>3}  {variant["label"]:<11}  '
-                      'no positive capacity-demand data')
-                continue
-            status = 'intersection' if pp['is_intersection'] else 'closest'
-            print(
-                f'{result["direction"]["label"]:>3}  '
-                f'{variant["label"]:<11}  '
-                f'{pp["sd"]:8.5f}  {pp["sa"]:8.5f}  {pp["teff"]:8.4f}  '
-                f'{pp["roof_disp_mm"]:8.2f}  {pp["base_shear_kN"]:9.2f}  '
-                f'{hz["Dy"]:7.5f}  {hz["Du"]:7.5f}  '
-                f'{hc.get("between IO and LS", 0):5d}  '
-                f'{hc.get("between LS and CP", 0):5d}  '
-                f'{hc.get(">= CP", 0):4d}  {status}'
-            )
+        result = results_by_direction.get(direction_key)
+        if result is None:
+            continue
+        pp = result['performance_point']
+        hz = result['hazus']
+        hc = result.get('hinge_damage_counts', {})
+        if pp is None:
+            print(f'{result["direction"]["label"]:>3}  no positive capacity-demand data')
+            continue
+        status = 'intersection' if pp['is_intersection'] else 'closest'
+        print(
+            f'{result["direction"]["label"]:>3}  '
+            f'{pp["sd"]:8.5f}  {pp["sa"]:8.5f}  {pp["teff"]:8.4f}  '
+            f'{pp["roof_disp_mm"]:8.2f}  {pp["base_shear_kN"]:9.2f}  '
+            f'{hz["Dy"]:7.5f}  {hz["Du"]:7.5f}  '
+            f'{hc.get("between IO and LS", 0):5d}  '
+            f'{hc.get("between LS and CP", 0):5d}  '
+            f'{hc.get(">= CP", 0):4d}  {status}'
+        )
 
     print('\n=== ACI 369.1M-17 hinge counts by member type ===')
-    hinge_header = 'Dir  Variant       Type      IO-LS  LS-CP  >=CP  Total'
+    hinge_header = 'Dir  Type      IO-LS  LS-CP  >=CP  Total'
     print(hinge_header)
     print('-' * len(hinge_header))
     for direction_key in _DIRECTION_ORDER:
-        variants = results_by_direction.get(direction_key, {})
-        for variant_key in _VARIANT_ORDER:
-            result = variants.get(variant_key)
-            if result is None:
-                continue
-            hc = result.get('hinge_damage_counts', {})
-            by_type = hc.get('by_type', {})
-            variant = result.get('variant', _VARIANT_CONFIGS[variant_key])
-            for member_type in ['beams', 'columns']:
-                counts = by_type.get(member_type, {})
-                print(
-                    f'{result["direction"]["label"]:>3}  '
-                    f'{variant["label"]:<11}  '
-                    f'{member_type:<7}  '
-                    f'{counts.get("between IO and LS", 0):5d}  '
-                    f'{counts.get("between LS and CP", 0):5d}  '
-                    f'{counts.get(">= CP", 0):4d}  '
-                    f'{counts.get("total", 0):5d}'
-                )
+        result = results_by_direction.get(direction_key)
+        if result is None:
+            continue
+        hc = result.get('hinge_damage_counts', {})
+        by_type = hc.get('by_type', {})
+        for member_type in ['beams', 'columns']:
+            counts = by_type.get(member_type, {})
+            print(
+                f'{result["direction"]["label"]:>3}  '
+                f'{member_type:<7}  '
+                f'{counts.get("between IO and LS", 0):5d}  '
+                f'{counts.get("between LS and CP", 0):5d}  '
+                f'{counts.get(">= CP", 0):4d}  '
+                f'{counts.get("total", 0):5d}'
+            )
 
 
 def _run_four_direction_adrs_parent():
     import matplotlib.pyplot as plt
 
     script_path = os.path.abspath(__file__)
-    results_by_direction = {key: {} for key in _DIRECTION_ORDER}
+    results_by_direction = {}
     with tempfile.TemporaryDirectory(prefix='ce259_adrs_') as tmpdir:
         for direction_key in _DIRECTION_ORDER:
             cfg = _DIRECTION_CONFIGS[direction_key]
-            for variant_key in _VARIANT_ORDER:
-                variant = _VARIANT_CONFIGS[variant_key]
-                out_path = os.path.join(tmpdir, f'{direction_key}_{variant_key}.json')
-                env = os.environ.copy()
-                env[_ADRS_WORKER_ENV] = '1'
-                env[_ADRS_DIRECTION_ENV] = direction_key
-                env[_ADRS_VARIANT_ENV] = variant_key
-                env[_ADRS_OUTPUT_ENV] = out_path
-                env.setdefault('MPLBACKEND', 'Agg')
-                print(f'Running {cfg["label"]} {variant["label"]} pushover worker...')
-                proc = subprocess.run(
-                    [sys.executable, script_path],
-                    cwd=os.path.dirname(script_path),
-                    env=env,
-                    text=True,
-                    capture_output=True,
-                )
-                if proc.stdout:
-                    print(proc.stdout, end='' if proc.stdout.endswith('\n') else '\n')
-                if proc.returncode != 0:
-                    if proc.stderr:
-                        print(proc.stderr, file=sys.stderr, end='' if proc.stderr.endswith('\n') else '\n')
-                    return proc.returncode
+            out_path = os.path.join(tmpdir, f'{direction_key}.json')
+            env = os.environ.copy()
+            env[_ADRS_WORKER_ENV] = '1'
+            env[_ADRS_DIRECTION_ENV] = direction_key
+            env[_ADRS_OUTPUT_ENV] = out_path
+            env.setdefault('MPLBACKEND', 'Agg')
+            print(f'Running {cfg["label"]} Original pushover worker...')
+            proc = subprocess.run(
+                [sys.executable, script_path],
+                cwd=os.path.dirname(script_path),
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            if proc.stdout:
+                print(proc.stdout, end='' if proc.stdout.endswith('\n') else '\n')
+            if proc.returncode != 0:
                 if proc.stderr:
                     print(proc.stderr, file=sys.stderr, end='' if proc.stderr.endswith('\n') else '\n')
-                with open(out_path, 'r', encoding='utf-8') as f:
-                    results_by_direction[direction_key][variant_key] = json.load(f)
+                return proc.returncode
+            if proc.stderr:
+                print(proc.stderr, file=sys.stderr, end='' if proc.stderr.endswith('\n') else '\n')
+            with open(out_path, 'r', encoding='utf-8') as f:
+                results_by_direction[direction_key] = json.load(f)
 
     _print_four_direction_summary(results_by_direction)
     for direction_key in _DIRECTION_ORDER:
-        variants = results_by_direction[direction_key]
-        original = variants.get('original')
-        retrofit = variants.get('retrofit')
-        if original is not None and retrofit is not None:
-            _plot_direction_adrs_comparison(original, retrofit)
-            _plot_direction_hinges_3d(retrofit)
+        result = results_by_direction.get(direction_key)
+        if result is not None:
+            _plot_direction_adrs(result)
+            _plot_direction_hinges_3d(result)
     plt.show()
     return 0
 
@@ -440,9 +300,7 @@ import matplotlib.animation as _animation
 
 _CURRENT_DIRECTION_KEY = os.environ.get(_ADRS_DIRECTION_ENV, 'pos_x')
 _CURRENT_DIRECTION = _DIRECTION_CONFIGS.get(_CURRENT_DIRECTION_KEY, _DIRECTION_CONFIGS['pos_x'])
-_CURRENT_VARIANT_KEY = os.environ.get(_ADRS_VARIANT_ENV, 'original')
-_CURRENT_VARIANT = _VARIANT_CONFIGS.get(_CURRENT_VARIANT_KEY, _VARIANT_CONFIGS['original'])
-_IS_RETROFIT = bool(_CURRENT_VARIANT['is_retrofit'])
+_ANALYSIS_LABEL = 'Original'
 _CTRL_NODE = 76
 _CTRL_DOF = _CURRENT_DIRECTION['dof']
 _DIRECTION_SIGN = _CURRENT_DIRECTION['sign']
@@ -668,18 +526,6 @@ ops.layer('straight', 2, 1, 2.010619e-04,  0.0000, -0.2320,  0.0000, -0.2320)   
 ops.layer('straight', 2, 1, 2.010619e-04,  0.0535, -0.2320,  0.0535, -0.2320)   # bot  D16
 ops.layer('straight', 2, 1, 2.010619e-04,  0.1070, -0.2320,  0.1070, -0.2320)   # bot  D16
 
-# Section 7: Retrofitted Beam [B 500 X 500]  b=500 mm x h=500 mm
-ops.section('Fiber', 7, '-GJ', 1.0)
-ops.patch('rect', 1, 30,  3,  -0.2500, 0.1900,  0.2500, 0.2500)     # top cover
-ops.patch('rect', 1, 30,  3,  -0.2500, -0.2500,  0.2500, -0.1900)   # bottom cover
-ops.patch('rect', 1,  8, 24,  -0.2500, -0.1900, -0.1900, 0.1900)    # left cover
-ops.patch('rect', 1,  8, 24,   0.1900, -0.1900,  0.2500, 0.1900)    # right cover
-ops.patch('rect', 1, 24, 24,  -0.1900, -0.1900,  0.1900, 0.1900)    # core
-for _x_bar in [-0.1820, -0.0820, -0.0492, -0.0164, 0.0164, 0.0492, 0.0820, 0.1820]:
-    ops.layer('straight', 2, 1, 2.010619e-04, _x_bar, 0.1820, _x_bar, 0.1820)   # top D16
-for _x_bar in [-0.1820, -0.0820, 0.0000, 0.0820, 0.1820]:
-    ops.layer('straight', 2, 1, 2.010619e-04, _x_bar, -0.1820, _x_bar, -0.1820) # bot D16
-
 # Section 4: Column [C 450 X 450]  b=450 mm × d=450 mm
 ops.section('Fiber', 4, '-GJ', 1.0)
 ops.patch('rect', 3, 30,  3,  -0.2250, 0.1850,  0.2250, 0.2250)     # top cover
@@ -746,13 +592,6 @@ ops.beamIntegration('Lobatto', 1, 1, 5)
 ops.beamIntegration('Lobatto', 2, 2, 5)
 ops.beamIntegration('Lobatto', 3, 3, 5)
 ops.beamIntegration('Lobatto', 4, 4, 5)
-ops.beamIntegration('Lobatto', _RETROFIT_BEAM_INTEGRATION_ID, _RETROFIT_BEAM_SECTION_ID, 5)
-
-
-def _beam_integration_for(et, default_integration):
-    if _IS_RETROFIT and et in _RETROFIT_BEAM_ELEMS:
-        return _RETROFIT_BEAM_INTEGRATION_ID
-    return default_integration
 
 # =====================================================================
 # COLUMN ELEMENTS  (forceBeamColumn,  geomTransf=1)
@@ -832,9 +671,9 @@ ops.element('forceBeamColumn',    68,    70,    84, 1, 4)   # ROOF STAIR|C7
 ops.element('forceBeamColumn',    69,     2,    10, 3, 3)   # GF|B25
 ops.element('forceBeamColumn',    70,    10,    18, 3, 3)   # GF|B26
 ops.element('forceBeamColumn',    71,    18,    32, 3, 3)   # GF|B27
-ops.element('forceBeamColumn',    72,     8,     6, 2, _beam_integration_for(72, 2))   # GF|B4
-ops.element('forceBeamColumn',    73,     6,     4, 2, _beam_integration_for(73, 2))   # GF|B12
-ops.element('forceBeamColumn',    74,     4,     2, 2, _beam_integration_for(74, 2))   # GF|B21
+ops.element('forceBeamColumn',    72,     8,     6, 2, 2)   # GF|B4
+ops.element('forceBeamColumn',    73,     6,     4, 2, 2)   # GF|B12
+ops.element('forceBeamColumn',    74,     4,     2, 2, 2)   # GF|B21
 ops.element('forceBeamColumn',    75,     4,    12, 3, 3)   # GF|B18
 ops.element('forceBeamColumn',    76,    12,    20, 3, 3)   # GF|B19
 ops.element('forceBeamColumn',    77,    20,    30, 3, 3)   # GF|B20
@@ -844,15 +683,15 @@ ops.element('forceBeamColumn',    80,    22,    28, 3, 3)   # GF|B10
 ops.element('forceBeamColumn',    81,     8,    16, 3, 3)   # GF|B1
 ops.element('forceBeamColumn',    82,    16,    24, 3, 3)   # GF|B2
 ops.element('forceBeamColumn',    83,    24,    26, 3, 3)   # GF|B3
-ops.element('forceBeamColumn',    84,    16,    14, 2, _beam_integration_for(84, 2))   # GF|B5
-ops.element('forceBeamColumn',    85,    14,    12, 2, _beam_integration_for(85, 2))   # GF|B13
-ops.element('forceBeamColumn',    86,    12,    10, 2, _beam_integration_for(86, 2))   # GF|B22
-ops.element('forceBeamColumn',    87,    24,    22, 2, _beam_integration_for(87, 2))   # GF|B6
-ops.element('forceBeamColumn',    88,    22,    20, 2, _beam_integration_for(88, 2))   # GF|B14
-ops.element('forceBeamColumn',    89,    20,    18, 2, _beam_integration_for(89, 2))   # GF|B23
-ops.element('forceBeamColumn',    90,    26,    28, 2, _beam_integration_for(90, 2))   # GF|B7
-ops.element('forceBeamColumn',    91,    28,    30, 2, _beam_integration_for(91, 2))   # GF|B16
-ops.element('forceBeamColumn',    92,    30,    32, 2, _beam_integration_for(92, 2))   # GF|B24
+ops.element('forceBeamColumn',    84,    16,    14, 2, 2)   # GF|B5
+ops.element('forceBeamColumn',    85,    14,    12, 2, 2)   # GF|B13
+ops.element('forceBeamColumn',    86,    12,    10, 2, 2)   # GF|B22
+ops.element('forceBeamColumn',    87,    24,    22, 2, 2)   # GF|B6
+ops.element('forceBeamColumn',    88,    22,    20, 2, 2)   # GF|B14
+ops.element('forceBeamColumn',    89,    20,    18, 2, 2)   # GF|B23
+ops.element('forceBeamColumn',    90,    26,    28, 2, 2)   # GF|B7
+ops.element('forceBeamColumn',    91,    28,    30, 2, 2)   # GF|B16
+ops.element('forceBeamColumn',    92,    30,    32, 2, 2)   # GF|B24
 ops.element('forceBeamColumn',    93,    33,    37, 3, 3)   # 2F|B25
 ops.element('forceBeamColumn',    94,    37,    41, 3, 3)   # 2F|B26
 ops.element('forceBeamColumn',    95,    41,    48, 3, 3)   # 2F|B27
@@ -1019,9 +858,7 @@ ops.pattern('Plain', 1, 1)
 # Y-beams  (geomTransf 2: local_y=+Z)  →  Wy = −w
 ops.eleLoad('-ele', 176, 180, 181, 182, 183, '-type', '-beamUniform', -2.4, 0.0, 0.0)
 ops.eleLoad('-ele', 124, 125, 126, 136, 137, 138, 139, 140, 141, 142, 143, 144, 175, 179, '-type', '-beamUniform', -3.6, 0.0, 0.0)
-_retrofit_beam_grav_w = _RETROFIT_BEAM_GRAV_W if _IS_RETROFIT else 3.6
-ops.eleLoad('-ele', *sorted(_RETROFIT_BEAM_ELEMS), '-type', '-beamUniform',
-            -_retrofit_beam_grav_w, 0.0, 0.0)
+ops.eleLoad('-ele', 72, 73, 74, 84, 85, 86, 87, 88, 89, 90, 91, 92, '-type', '-beamUniform', -3.6, 0.0, 0.0)
 ops.eleLoad('-ele', 96, 97, 98, 108, 109, 110, 111, 112, 113, 114, 115, 116, 150, 151, 152, 162, 163, 164, 165, 166, 167, 168, 169, 170, '-type', '-beamUniform', -5.04, 0.0, 0.0)
 # X-beams  (geomTransf 3: local_y=−Z)  →  Wy = +w
 ops.eleLoad('-ele', 117, 118, 119, 120, 145, 146, 171, 172, 177, 178, '-type', '-beamUniform', 2.4, 0.0, 0.0)
@@ -1038,14 +875,14 @@ ops.algorithm('ModifiedNewton', '-initial')
 ops.integrator('LoadControl', 0.1)
 ops.analysis('Static')
 ops.analyze(10)
-print(f'{_DIRECTION_LABEL} {_CURRENT_VARIANT["label"]} gravity analysis complete.')
+print(f'{_DIRECTION_LABEL} {_ANALYSIS_LABEL} gravity analysis complete.')
 
 # Capture total seismic weight W from vertical base reactions after gravity.
 # Fixed base nodes: [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31]
 ops.reactions()
 _W_seismic = abs(sum(ops.nodeReaction(n, 3)
                      for n in [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31]))
-print(f'{_DIRECTION_LABEL} {_CURRENT_VARIANT["label"]} total seismic weight W = {_W_seismic:.2f} kN')
+print(f'{_DIRECTION_LABEL} {_ANALYSIS_LABEL} total seismic weight W = {_W_seismic:.2f} kN')
 
 # =====================================================================
 # MODAL ANALYSIS  —  assign lumped masses from self-weight; ops.eigen(1)
@@ -1064,10 +901,9 @@ for _et in list(range(1, 69)) + [218, 219, 220, 221, 222, 223, 224, 225, 226, 22
     _ele_w_grav[_et] = 4.86
 for _et in [176, 180, 181, 182, 183]:
     _ele_w_grav[_et] = 2.4
-for _et in [124, 125, 126, 136, 137, 138, 139, 140, 141, 142, 143, 144, 175, 179]:
+for _et in [72, 73, 74, 84, 85, 86, 87, 88, 89, 90, 91, 92,
+            124, 125, 126, 136, 137, 138, 139, 140, 141, 142, 143, 144, 175, 179]:
     _ele_w_grav[_et] = 3.6
-for _et in sorted(_RETROFIT_BEAM_ELEMS):
-    _ele_w_grav[_et] = _retrofit_beam_grav_w
 for _et in [96, 97, 98, 108, 109, 110, 111, 112, 113, 114, 115, 116,
             150, 151, 152, 162, 163, 164, 165, 166, 167, 168, 169, 170]:
     _ele_w_grav[_et] = 5.04
@@ -1112,7 +948,7 @@ _lambdas  = ops.eigen(_n_modes)
 _mi_modal = {nd: _node_trib_W[nd] / _g_accel for nd in _node_trib_W}
 _Mt_modal = sum(_mi_modal.values())
 
-print(f'--- Modal scan ({_DIRECTION_LABEL} {_CURRENT_VARIANT["label"]} direction) ---')
+print(f'--- Modal scan ({_DIRECTION_LABEL} {_ANALYSIS_LABEL} direction) ---')
 _mode_candidates = []
 for _m in range(1, _n_modes + 1):
     _om_m = math.sqrt(_lambdas[_m - 1])
@@ -1133,7 +969,7 @@ for _m in range(1, _n_modes + 1):
 _mode_candidates.sort(key=lambda x: -x[0])
 _Meff_dir_best, _mode_dir, _omega1, _phi_raw_best, _phi_max_best = _mode_candidates[0]
 _T1 = 2.0 * math.pi / _omega1
-print(f'{_DIRECTION_LABEL} {_CURRENT_VARIANT["label"]} dominant mode: '
+print(f'{_DIRECTION_LABEL} {_ANALYSIS_LABEL} dominant mode: '
       f'Mode {_mode_dir}  (T\u2081 = {_T1:.3f} s)')
 
 # Normalise to max|φ|=1 AND enforce POSITIVE sign at the control node.
@@ -1255,13 +1091,6 @@ _ACI_SECTION_META = {
         'bottom_z': [-0.2320] * 5,
         'transverse': _ACI_TRANSVERSE_DEFAULT,
     },
-    7: {
-        'kind': 'beam', 'label': 'B500x500 jacketed', 'b': 0.500, 'h': 0.500,
-        'fc_mpa': 21.0, 'fy_mpa': 414.0, 'bar_area': _D16_AREA,
-        'top_z': [0.1820] * 8,
-        'bottom_z': [-0.1820] * 5,
-        'transverse': _ACI_TRANSVERSE_DEFAULT,
-    },
     4: {
         'kind': 'column', 'label': 'C450x450', 'b': 0.450, 'h': 0.450,
         'fc_mpa': 28.0, 'fy_mpa': 414.0, 'bar_area': _D16_AREA,
@@ -1290,13 +1119,6 @@ for _et in _ACI_BEAM_SECTION_2_ELEMS:
     _ACI_ELEMENT_META[_et] = {'kind': 'beam', 'section': 2}
 for _et in _ACI_BEAM_SECTION_3_ELEMS:
     _ACI_ELEMENT_META[_et] = {'kind': 'beam', 'section': 3}
-if _IS_RETROFIT:
-    for _et in _RETROFIT_BEAM_ELEMS:
-        _ACI_ELEMENT_META[_et] = {
-            'kind': 'beam',
-            'section': _RETROFIT_BEAM_SECTION_ID,
-            'retrofit': True,
-        }
 
 _n_int_pts_v        = 5
 _hinge_snapshots_v  = []   # one entry per pushover step
@@ -1345,7 +1167,7 @@ for step in range(n_steps):
         'forces': _snap_forces,
     })
 
-print(f'{_DIRECTION_LABEL} {_CURRENT_VARIANT["label"]} pushover complete.')
+print(f'{_DIRECTION_LABEL} {_ANALYSIS_LABEL} pushover complete.')
 
 # =====================================================================
 # VISUALISATION
@@ -1885,10 +1707,10 @@ else:
     _performance_point['roof_disp_mm'] = _pp_roof_disp_mm
     _performance_point['base_shear_kN'] = _pp_base_shear
     if _performance_point['is_intersection']:
-        print(f'{_DIRECTION_LABEL} {_CURRENT_VARIANT["label"]} performance point '
+        print(f'{_DIRECTION_LABEL} {_ANALYSIS_LABEL} performance point '
               'from ASCE 41-23 secant-stiffness demand:')
     else:
-        print(f'WARNING: No {_DIRECTION_LABEL} {_CURRENT_VARIANT["label"]} '
+        print(f'WARNING: No {_DIRECTION_LABEL} {_ANALYSIS_LABEL} '
               'capacity-demand intersection within pushover range; reporting closest approach:')
     print(f'  Sd = {_pp_sd:.5f} m')
     print(f'  Sa = {_pp_sa:.5f} g')
@@ -1902,7 +1724,7 @@ else:
 _hazus = _idealize_capacity_equal_area(_capacity_sd, _capacity_sa)
 if _hazus is None:
     print(f'WARNING: HAZUS damage thresholds could not be computed for '
-          f'{_DIRECTION_LABEL} {_CURRENT_VARIANT["label"]}.')
+          f'{_DIRECTION_LABEL} {_ANALYSIS_LABEL}.')
     _hazus = {
         'Dy': 0.0,
         'Ay': 0.0,
@@ -1914,7 +1736,7 @@ if _hazus is None:
         'thresholds': {'Slight': 0.0, 'Moderate': 0.0, 'Extensive': 0.0, 'Complete': 0.0},
     }
 else:
-    print(f'{_DIRECTION_LABEL} {_CURRENT_VARIANT["label"]} HAZUS-MH 2.1 damage thresholds '
+    print(f'{_DIRECTION_LABEL} {_ANALYSIS_LABEL} HAZUS-MH 2.1 damage thresholds '
           'from equal-area bilinear capacity:')
     print(f'  Dy = {_hazus["Dy"]:.5f} m | Ay = {_hazus["Ay"]:.5f} g')
     print(f'  Du = {_hazus["Du"]:.5f} m | Au = {_hazus["Au"]:.5f} g')
@@ -1951,7 +1773,7 @@ elif _performance_point is None:
 _hinge_damage_counts, _hinging_members = _aci369_hinge_counts_at_performance(
     _performance_point['roof_disp_mm'])
 _frame_members = _frame_members_for_hinge_plot()
-print(f'{_DIRECTION_LABEL} {_CURRENT_VARIANT["label"]} ACI 369.1M-17 member hinge counts '
+print(f'{_DIRECTION_LABEL} {_ANALYSIS_LABEL} ACI 369.1M-17 member hinge counts '
       'at performance point:')
 print(f'  between IO and LS = {_hinge_damage_counts["between IO and LS"]}')
 print(f'  between LS and CP = {_hinge_damage_counts["between LS and CP"]}')
@@ -1968,13 +1790,6 @@ for _member_type in ['beams', 'columns']:
 if os.environ.get(_ADRS_OUTPUT_ENV):
     _worker_payload = {
         'direction': _CURRENT_DIRECTION,
-        'variant': _CURRENT_VARIANT,
-        'retrofit': {
-            'enabled': _IS_RETROFIT,
-            'beam_elements': sorted(_RETROFIT_BEAM_ELEMS) if _IS_RETROFIT else [],
-            'beam_section': _RETROFIT_BEAM_SECTION_ID if _IS_RETROFIT else None,
-            'beam_gravity_w_kN_per_m': _retrofit_beam_grav_w if _IS_RETROFIT else 3.6,
-        },
         'modal': {
             'mode': _mode_dir,
             'T1': _T1,
